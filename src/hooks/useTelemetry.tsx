@@ -9,20 +9,32 @@ import {
   type ReactNode,
 } from "react";
 
-import { createTelemetrySource, SEED_ALERTS } from "@/services/api";
+import {
+  getAlerts,
+  getMapData,
+  getSystemStatus,
+  getTelemetry,
+  getTelemetryLog,
+  normalizeAlerts,
+  normalizeLogRows,
+  normalizeTelemetryFrame,
+  sendRoverCommand,
+  setDemoScenario,
+  type DemoScenario,
+  type RoverCommand,
+} from "@/services/api";
 import type {
   AlertEvent,
   LogRow,
-  RoverCommand,
+  RoverCommand as RoverCommandType,
   ScenarioId,
   TelemetryFrame,
 } from "@/types/telemetry";
-import { frameToLogRow } from "@/utils/format";
 
 interface TelemetryContextValue {
   frame: TelemetryFrame | null;
   alerts: AlertEvent[];
-  commands: RoverCommand[];
+  commands: RoverCommandType[];
   log: LogRow[];
   scenario: ScenarioId;
   setScenario: (id: ScenarioId) => void;
@@ -32,28 +44,36 @@ interface TelemetryContextValue {
   startSession: () => void;
   stopSession: () => void;
   clearLog: () => void;
-  sendCommand: (c: RoverCommand["command"]) => void;
+  sendCommand: (c: RoverCommandType["command"]) => void;
   criticalCount: number;
   soundEnabled: boolean;
   toggleSound: () => void;
   acknowledgeAlerts: () => void;
   unreadAlerts: number;
+  loading: boolean;
+  error: string | null;
 }
 
 const TelemetryContext = createContext<TelemetryContextValue | null>(null);
 
+const POLL_INTERVAL_MS = 1000;
 const MAX_LOG = 400;
 const MAX_ALERTS = 120;
+const MAX_COMMANDS = 40;
+
+const demoScenarioMap: Record<ScenarioId, DemoScenario> = {
+  normal: "NORMAL",
+  "gas-leak": "GAS_LEAK",
+  "trapped-worker": "TRAPPED_WORKER",
+  "fire-smoke": "FIRE_SMOKE",
+  structural: "STRUCTURAL_INSTABILITY",
+  "comms-loss": "COMMUNICATION_LOSS",
+};
 
 export function TelemetryProvider({ children }: { children: ReactNode }) {
-  const sourceRef = useRef<ReturnType<typeof createTelemetrySource> | null>(null);
-  if (sourceRef.current === null && typeof window !== "undefined") {
-    sourceRef.current = createTelemetrySource();
-  }
-
   const [frame, setFrame] = useState<TelemetryFrame | null>(null);
-  const [alerts, setAlerts] = useState<AlertEvent[]>(SEED_ALERTS.slice().reverse());
-  const [commands, setCommands] = useState<RoverCommand[]>([]);
+  const [alerts, setAlerts] = useState<AlertEvent[]>([]);
+  const [commands, setCommands] = useState<RoverCommandType[]>([]);
   const [log, setLog] = useState<LogRow[]>([]);
   const [scenario, setScenarioState] = useState<ScenarioId>("normal");
   const [sessionActive, setSessionActive] = useState(true);
@@ -61,61 +81,81 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   const [sessionElapsed, setSessionElapsed] = useState(0);
   const [soundEnabled, setSoundEnabled] = useState(false);
   const [unreadAlerts, setUnreadAlerts] = useState(0);
-  const [criticalCount, setCriticalCount] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const sessionActiveRef = useRef(sessionActive);
-  sessionActiveRef.current = sessionActive;
-  const soundRef = useRef(soundEnabled);
-  soundRef.current = soundEnabled;
+  const previousFrameRef = useRef<TelemetryFrame | null>(null);
+  const previousAlertsRef = useRef<AlertEvent[]>([]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [telemetry, alertsPayload, mapData, systemStatus, logRows] = await Promise.all([
+        getTelemetry(),
+        getAlerts(50),
+        getMapData(),
+        getSystemStatus(),
+        getTelemetryLog(200),
+      ]);
+
+      const nextFrame = normalizeTelemetryFrame(telemetry, mapData, systemStatus, previousFrameRef.current);
+      previousFrameRef.current = nextFrame;
+
+      const nextAlerts = normalizeAlerts(alertsPayload).slice(0, MAX_ALERTS);
+      const newAlertCount = nextAlerts.filter((alert) => !previousAlertsRef.current.some((prev) => prev.id === alert.id)).length;
+      previousAlertsRef.current = nextAlerts;
+
+      setFrame(nextFrame);
+      setScenarioState(nextFrame.scenario);
+      setAlerts(nextAlerts);
+      setUnreadAlerts((current) => current + newAlertCount);
+
+      const nextLog = normalizeLogRows(logRows).slice(0, MAX_LOG);
+      setLog((current) => (sessionActive ? nextLog : current));
+      setLoading(false);
+      setError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+      setLoading(false);
+    }
+  }, [sessionActive]);
 
   useEffect(() => {
-    const src = sourceRef.current;
-    if (!src) return;
-    setSessionStartedAt((prev) => prev ?? Date.now());
-    src.start();
+    if (!sessionStartedAt) setSessionStartedAt(Date.now());
 
-    const offTel = src.subscribeTelemetry((f) => {
-      setFrame(f);
-      if (sessionActiveRef.current) {
-        setLog((prev) => [frameToLogRow(f), ...prev].slice(0, MAX_LOG));
-      }
-    });
+    void refresh();
+    const intervalId = window.setInterval(() => {
+      void refresh();
+    }, POLL_INTERVAL_MS);
 
-    const offAlerts = src.subscribeAlerts((a) => {
-      setAlerts((prev) => [a, ...prev].slice(0, MAX_ALERTS));
-      setUnreadAlerts((n) => n + 1);
-      if (a.severity === "critical") setCriticalCount((n) => n + 1);
-      if (soundRef.current && a.severity !== "info") beep(a.severity === "critical" ? 660 : 440);
-    });
-
-    const offCmd = src.subscribeCommands((c) => {
-      setCommands((prev) => [c, ...prev].slice(0, 40));
-    });
-
-    return () => {
-      offTel();
-      offAlerts();
-      offCmd();
-      src.stop();
-    };
-  }, []);
+    return () => window.clearInterval(intervalId);
+  }, [refresh, sessionStartedAt]);
 
   useEffect(() => {
     if (!sessionActive || !sessionStartedAt) return;
-    const id = setInterval(() => setSessionElapsed(Date.now() - sessionStartedAt), 1000);
-    setSessionElapsed(Date.now() - sessionStartedAt);
-    return () => clearInterval(id);
+
+    const updateTimer = () => setSessionElapsed(Date.now() - sessionStartedAt);
+    updateTimer();
+    const intervalId = window.setInterval(updateTimer, 1000);
+
+    return () => window.clearInterval(intervalId);
   }, [sessionActive, sessionStartedAt]);
 
-  const setScenario = useCallback((id: ScenarioId) => {
-    setScenarioState(id);
-    sourceRef.current?.setScenario(id);
+  const setScenario = useCallback(async (id: ScenarioId) => {
+    const payload = demoScenarioMap[id];
+    if (!payload) return;
+
+    try {
+      await setDemoScenario(payload);
+      setScenarioState(id);
+    } catch {
+      // leave the existing state unchanged if the backend call fails
+    }
   }, []);
 
   const startSession = useCallback(() => {
     setSessionActive(true);
     setSessionStartedAt(Date.now());
-    sourceRef.current?.start();
   }, []);
 
   const stopSession = useCallback(() => {
@@ -124,14 +164,22 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
 
   const clearLog = useCallback(() => setLog([]), []);
 
-  const sendCommand = useCallback((c: RoverCommand["command"]) => {
-    void sourceRef.current?.sendCommand(c);
+  const sendCommand = useCallback(async (command: RoverCommandType["command"]) => {
+    try {
+      await sendRoverCommand(command);
+      const timestamp = Date.now();
+      setCommands((current) => [{ id: `cmd-${timestamp}`, command, timestamp, ack: true }, ...current].slice(0, MAX_COMMANDS));
+    } catch {
+      // keep the UI responsive even if the command API is unavailable
+    }
   }, []);
 
-  const toggleSound = useCallback(() => setSoundEnabled((s) => !s), []);
+  const toggleSound = useCallback(() => setSoundEnabled((current) => !current), []);
   const acknowledgeAlerts = useCallback(() => setUnreadAlerts(0), []);
 
-  const value = useMemo(
+  const criticalCount = useMemo(() => frame?.gases.filter((gas) => gas.status === "critical").length ?? 0, [frame]);
+
+  const value = useMemo<TelemetryContextValue>(
     () => ({
       frame,
       alerts,
@@ -151,27 +199,10 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       toggleSound,
       acknowledgeAlerts,
       unreadAlerts,
+      loading,
+      error,
     }),
-    [
-      frame,
-      alerts,
-      commands,
-      log,
-      scenario,
-      setScenario,
-      sessionActive,
-      sessionStartedAt,
-      sessionElapsed,
-      startSession,
-      stopSession,
-      clearLog,
-      sendCommand,
-      criticalCount,
-      soundEnabled,
-      toggleSound,
-      acknowledgeAlerts,
-      unreadAlerts,
-    ],
+    [alerts, clearLog, commands, criticalCount, error, frame, loading, log, scenario, sendCommand, sessionActive, sessionStartedAt, sessionElapsed, setScenario, soundEnabled, startSession, stopSession, toggleSound, acknowledgeAlerts, unreadAlerts],
   );
 
   return <TelemetryContext.Provider value={value}>{children}</TelemetryContext.Provider>;
@@ -179,26 +210,9 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
 
 export function useTelemetry() {
   const ctx = useContext(TelemetryContext);
-  if (!ctx) throw new Error("useTelemetry must be used inside TelemetryProvider");
-  return ctx;
-}
-
-/** Simulated alert tone (WebAudio) — opt-in via the sound toggle. */
-function beep(freq: number) {
-  try {
-    const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctor) return;
-    const ctx = new Ctor();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = "square";
-    osc.frequency.value = freq;
-    gain.gain.value = 0.03;
-    osc.connect(gain).connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.12);
-    setTimeout(() => void ctx.close(), 400);
-  } catch {
-    /* audio unavailable — silent by design */
+  if (!ctx) {
+    throw new Error("useTelemetry must be used inside TelemetryProvider");
   }
+
+  return ctx;
 }

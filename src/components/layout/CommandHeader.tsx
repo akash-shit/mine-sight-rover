@@ -9,7 +9,7 @@ import { clockTime, duration, statusDot, statusLabel, statusText } from "@/utils
 import { cn } from "@/lib/utils";
 
 export function CommandHeader() {
-  const { frame, sessionElapsed } = useTelemetry();
+  const { frame, sessionElapsed, error } = useTelemetry();
   const { operator, signOut } = useSession();
   const [now, setNow] = useState<number | null>(null);
 
@@ -60,6 +60,9 @@ export function CommandHeader() {
           <span className={cn("h-1.5 w-1.5 rounded-full animate-status-pulse", statusDot[threat])} aria-hidden />
           THREAT LEVEL {statusLabel[threat]}
         </span>
+        {error ? (
+          <span className="label-chip border border-danger/60 bg-danger/10 px-2 py-1 text-danger">LINK LOST — RETRYING</span>
+        ) : null}
         <span className="label-chip hidden text-muted-foreground md:inline">
           {operator?.operatorId ?? "RESCUE-OPS-01"}
         </span>
